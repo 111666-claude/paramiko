@@ -27,6 +27,7 @@ from paramiko.transport import (
     Transport,
 )
 from paramiko.client import (
+    AcceptNewPolicy,
     AutoAddPolicy,
     MissingHostKeyPolicy,
     RejectPolicy,

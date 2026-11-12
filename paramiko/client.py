@@ -33,10 +33,9 @@ from paramiko.common import DEBUG
 from paramiko.config import SSH_PORT
 from paramiko.ecdsakey import ECDSAKey
 from paramiko.ed25519key import Ed25519Key
-from paramiko.hostkeys import HostKeys
+from paramiko.hostkeys import HostKeyResult, HostKeys
 from paramiko.rsakey import RSAKey
 from paramiko.ssh_exception import (
-    BadHostKeyException,
     NoValidConnectionsError,
     SSHException,
 )
@@ -140,14 +139,10 @@ class SSHClient(ClosingContextManager):
         if self._host_keys_filename is not None:
             self.load_host_keys(self._host_keys_filename)
 
-        with open(filename, "w") as f:
-            for hostname, keys in self._host_keys.items():
-                for keytype, key in keys.items():
-                    f.write(
-                        "{} {} {}\n".format(
-                            hostname, keytype, key.get_base64()
-                        )
-                    )
+        # Write at the entry level so OpenSSH markers (@cert-authority,
+        # @revoked), hashed names and multi-host lines are preserved instead
+        # of being flattened into plain lines (or dropped entirely).
+        self._host_keys.save(filename)
 
     def get_host_keys(self):
         """
@@ -188,6 +183,19 @@ class SSHClient(ClosingContextManager):
         if inspect.isclass(policy):
             policy = policy()
         self._policy = policy
+
+    @staticmethod
+    def _transport_key_alias(keytype):
+        """
+        Translate a known_hosts key type into a Transport algorithm name.
+
+        known_hosts stores RSA host keys as ``ssh-rsa`` while the Transport's
+        negotiated algorithms use the SHA-2 variants; prefer the strongest
+        supported variant, as OpenSSH does.
+        """
+        if keytype == "ssh-rsa":
+            return "rsa-sha2-512"
+        return keytype
 
     def _families_and_addresses(self, hostname, port):
         """
@@ -406,39 +414,36 @@ class SSHClient(ClosingContextManager):
             server_hostkey_name = hostname
         else:
             server_hostkey_name = "[{}]:{}".format(hostname, port)
-        our_server_keys = None
 
-        our_server_keys = self._system_host_keys.get(server_hostkey_name)
+        # Merge system and local known_hosts into one lookup.  System keys
+        # take precedence (they are read-only and considered more trusted),
+        # but local entries for other key types remain visible, so a host
+        # with e.g. both an RSA and an Ed25519 key is never reduced to only
+        # whichever source was consulted first.
+        our_server_keys = self._system_host_keys.lookup(server_hostkey_name)
+        local_keys = self._host_keys.lookup(server_hostkey_name)
         if our_server_keys is None:
-            # TODO: this is getting us the test suite _test_connection host key
-            # setup by virtue of that code doing tc.get_host_keys().add() (that
-            # method wraps self._host_keys)
-            # TODO: it should be analogous to running paramiko w/ a
-            # ~/.ssh/known_hosts file
-            our_server_keys = self._host_keys.get(server_hostkey_name)
+            our_server_keys = local_keys
+        elif local_keys is not None:
+            our_server_keys = _MergedHostKeyResult(
+                server_hostkey_name, our_server_keys, local_keys
+            )
         if our_server_keys is not None:
-            # TODO: keytype needs to turn into one of the rsa-sha2 keys if it's
-            # an RSAKey.
-            # TODO: where is the equivalent on our server-side? hopefully the
-            # tests exercise that lol
-            # TODO: also, is it just me or does this [0] mean we literally do
-            # not actually implement real HostKeyAlgorithms agreement like
-            # ssh.c does?! eesh
-            keytype = our_server_keys.keys()[0]
+            # Deterministically reorder the Transport's preferred host key
+            # algorithms so every key type recorded in known_hosts is tried
+            # ahead of unrecorded ones.  OpenSSH prefers known key types over
+            # unknown ones; taking only the first stored key type (the old
+            # behavior) made rotation/multi-algorithm hosts nondeterministic
+            # and could force a mismatch when the first type was unavailable.
+            known_types = [
+                self._transport_key_alias(k) for k in our_server_keys.keys()
+            ]
             sec_opts = t.get_security_options()
-            # TODO: clean this up a bit, but it does help some tests pass!
-            if keytype == "ssh-rsa":
-                if "rsa-sha2-512" in sec_opts.key_types:
-                    keytype = "rsa-sha2-512"
-                elif "rsa-sha2-256" in sec_opts.key_types:
-                    keytype = "rsa-sha2-256"
-                else:
-                    # TODO: vvv
-                    raise Exception(
-                        "TODO: REPLACEME with appropriate exception for 'what even is this key type in your known_hosts files?'"  # noqa
-                    )
-            other_types = [x for x in sec_opts.key_types if x != keytype]
-            sec_opts.key_types = [keytype] + other_types
+            supported = list(sec_opts.key_types)
+            reordered = [
+                k for k in dict.fromkeys(known_types) if k in supported
+            ] + [k for k in supported if k not in known_types]
+            sec_opts.key_types = reordered
 
         t.start_client(timeout=timeout)
 
@@ -449,15 +454,14 @@ class SSHClient(ClosingContextManager):
                 self, server_hostkey_name, server_key
             )
         else:
-            # TODO: this should 'just work' but dblcheck (HostKeys will be
-            # offering an ssh-rsa-via-sha2 key as "ssh-rsa" still, and the
-            # key would be RSAKey whose .get_name would still say
-            # "ssh-rsa")
-            our_key = our_server_keys.get(server_key.get_name())
-            if our_key != server_key:
-                if our_key is None:
-                    our_key = list(our_server_keys.values())[0]
-                raise BadHostKeyException(hostname, server_key, our_key)
+            # Verify against the *merged* view so that a key type stored in
+            # only one of system/local known_hosts is not mistaken for a
+            # rotation by the other store.  Revocation, cert-authority trust
+            # and plain-key equality all live in HostKeys.verify_host_key.
+            merged = HostKeys.from_stores(
+                self._system_host_keys, self._host_keys
+            )
+            merged.verify_host_key(server_hostkey_name, server_key)
 
         if username is None:
             username = getpass.getuser()
@@ -783,6 +787,25 @@ class SSHClient(ClosingContextManager):
         self._transport._log(level, msg)
 
 
+class _MergedHostKeyResult(HostKeyResult):
+    """
+    A `.HostKeyResult` view merging system (read-only) and local
+    known_hosts lookups for the same hostname.
+
+    System entries take precedence per key type; local entries only fill in
+    key types the system store does not have.
+    """
+
+    def __init__(self, hostname, system_result, local_result):
+        super().__init__(
+            hostname,
+            system_result.entries + local_result.entries,
+        )
+        merged = dict(local_result._keys)
+        merged.update(system_result._keys)
+        self._keys = merged
+
+
 class MissingHostKeyPolicy:
     """
     Interface for defining the policy that `.SSHClient` should use when the
@@ -837,6 +860,43 @@ class RejectPolicy(MissingHostKeyPolicy):
         )
         raise SSHException(
             "Server {!r} not found in known_hosts".format(hostname)
+        )
+
+
+class AcceptNewPolicy(MissingHostKeyPolicy):
+    """
+    Policy corresponding to OpenSSH's
+    ``StrictHostKeyChecking=accept-new``: accept and record keys for hosts
+    that are genuinely unknown, but never overwrite or supplement an entry
+    for a host already present in known_hosts.
+
+    Unlike `.AutoAddPolicy`, this policy refuses to write anything when the
+    hostname already has any stored key (even one of a different type);
+    mismatches and rotations continue to surface as
+    `.BadHostKeyException` from the connection logic before this policy is
+    ever consulted.
+    """
+
+    def missing_host_key(self, client, hostname, key):
+        already_known = (
+            client._host_keys.lookup(hostname) is not None
+            or client._system_host_keys.lookup(hostname) is not None
+        )
+        if already_known:
+            raise SSHException(
+                "Server {!r} has a known_hosts entry but presented a key of "
+                "an unknown type; refusing to add it automatically".format(
+                    hostname
+                )
+            )
+        client._host_keys.add(hostname, key.get_name(), key)
+        if client._host_keys_filename is not None:
+            client.save_host_keys(client._host_keys_filename)
+        client._log(
+            DEBUG,
+            "Adding {} host key for previously-unknown {}: {}".format(
+                key.get_name(), hostname, hexlify(key.get_fingerprint())
+            ),
         )
 
 

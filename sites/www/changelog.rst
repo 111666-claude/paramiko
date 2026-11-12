@@ -2,6 +2,34 @@
 Changelog
 =========
 
+- :bug:`- major` Reworked known-hosts verification in `.HostKeys` and
+  `.SSHClient` so unknown hosts can no longer be accidentally accepted and
+  stale/conflicting keys are no longer silently overwritten. Highlights:
+
+  - Hostname matching now implements the full OpenSSH ``known_hosts`` rule
+    set: literal names and ``[host]:port`` aliases, hashed ``|1|...`` names,
+    ``*``/``?`` wildcard patterns, and ``!`` negation patterns (which veto a
+    host globally, matching OpenSSH behavior).
+  - `.HostKeys.lookup` returns a `.HostKeyResult` that preserves every
+    matching line in deterministic file order, including multiple key
+    algorithms for one host; the negotiated host-key algorithm list is now
+    reordered from *all* known key types (not just the first one found), and
+    RSA ``ssh-rsa`` entries map deterministically to the strongest supported
+    ``rsa-sha2-*`` algorithm.
+  - A host present in ``known_hosts`` that presents a key of a different
+    type (host-key rotation) or a mismatching key of the same type now always
+    raises `.BadHostKeyException`; the missing-host-key policy only runs for
+    genuinely unknown hosts. Added `.AcceptNewPolicy`, mirroring OpenSSH's
+    ``StrictHostKeyChecking=accept-new``.
+  - Added support for the ``@cert-authority`` and ``@revoked`` line markers,
+    including verification of OpenSSH host certificates (signature, embedded
+    CA, principals) against trusted CA keys, and unconditional rejection of
+    revoked keys/certificates.
+  - Malformed ``known_hosts`` lines (bad base64, too few fields, unknown
+    markers/key types) are skipped with a log message instead of aborting the
+    load or weakening verification of other valid entries.
+  - `.SSHClient.save_host_keys` now preserves markers, hashed names and
+    multi-host lines instead of flattening or dropping them.
 - :release:`5.1.0 <2026-10-17>`
 - :release:`5.0.1 <2026-10-17>`
 - :bug:`2462` (w/ earlier fix attempts :issue:`2475` and :issue:`2465`) An API
