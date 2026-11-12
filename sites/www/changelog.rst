@@ -2,6 +2,31 @@
 Changelog
 =========
 
+- :bug:`- major` `~paramiko.hostkeys.HostKeys` now implements the OpenSSH
+  ``known_hosts`` hostname matching rules more faithfully:
+
+  - wildcard (``*``/``?``) and ``!``-prefixed negation patterns are now
+    understood, with negation taking precedence over positive patterns;
+  - hashed (``|1|salt|hash``) entries are matched against both the bare
+    hostname and its ``[host]:port`` bracketed form;
+  - wildcard and negation patterns correctly apply to the host portion of a
+    bracketed ``[host]:port`` lookup (the port itself remains a distinct,
+    literal dimension).
+- :bug:`- major` Conflicting host keys are no longer overwritten silently.
+  `~paramiko.hostkeys.HostKeys.add` now raises the new
+  `~paramiko.hostkeys.HostKeyConflictError` when a *different* key of the same
+  type is already stored for a host (adding the same key twice remains a
+  no-op), and `~paramiko.hostkeys.HostKeys.load` skips conflicting lines with
+  a warning instead of replacing the known key. Rotate a key by deleting the
+  old entry first. Unknown hosts continue to be handed to the configured
+  `~paramiko.client.MissingHostKeyPolicy`.
+- :bug:`-` `~paramiko.hostkeys.HostKeys.load` no longer mutates a line's
+  hostname list while iterating over it, and unparsable/``known_hosts`` lines
+  (bad field counts, invalid base64, empty fields, trailing comments or runs
+  of spaces/tabs) are skipped or parsed correctly instead of corrupting the
+  surrounding entries. The per-host view returned by
+  `~paramiko.hostkeys.HostKeys.lookup` also lists each key type only once even
+  when several entries match the same host.
 - :release:`5.1.0 <2026-10-17>`
 - :release:`5.0.1 <2026-10-17>`
 - :bug:`2462` (w/ earlier fix attempts :issue:`2475` and :issue:`2465`) An API

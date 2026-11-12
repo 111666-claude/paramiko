@@ -18,6 +18,7 @@
 
 
 import binascii
+import fnmatch
 import os
 import re
 from base64 import decodebytes, encodebytes
@@ -28,6 +29,21 @@ from hmac import HMAC
 from paramiko.pkey import PKey, UnknownKeyType
 from paramiko.ssh_exception import SSHException
 from paramiko.util import b, constant_time_bytes_eq, get_logger, u
+
+
+class HostKeyConflictError(SSHException):
+    """
+    Raised when a host key entry already exists for a given
+    ``(hostname, keytype)`` pair but carries a *different* key, and the
+    caller tried to replace it through an API that refuses to overwrite
+    conflicting keys silently.
+
+    OpenSSH treats such a conflict as a possible host-key compromise and
+    refuses to update ``known_hosts`` on its own; the stale entry has to be
+    removed explicitly first.  Paramiko now follows the same rule.
+
+    .. versionadded:: 5.1
+    """
 
 
 class HostKeys(MutableMapping):
@@ -56,17 +72,38 @@ class HostKeys(MutableMapping):
 
     def add(self, hostname, keytype, key):
         """
-        Add a host key entry to the table.  Any existing entry for a
-        ``(hostname, keytype)`` pair will be replaced.
+        Add a host key entry to the table.
+
+        If an entry for the ``(hostname, keytype)`` pair already exists:
+
+        * an entry holding the *same* key is left untouched (this makes
+          `add` idempotent, which `load` relies on when the same host line
+          appears more than once);
+        * an entry holding a *different* key is a conflict.  The existing
+          key is never silently overwritten; instead `.HostKeyConflictError`
+          is raised, mirroring OpenSSH's refusal to replace a changed host
+          key without explicit user action.  Remove the stale entry first
+          (e.g. with ``del hostkeys[hostname]``) and then add the new key.
 
         :param str hostname: the hostname (or IP) to add
         :param str keytype: key type (in ``"ssh-<type>"`` format)
         :param .PKey key: the key to add
+
+        :raises .HostKeyConflictError: if a different key of the same type
+            is already stored for ``hostname``
         """
         for e in self._entries:
             if (hostname in e.hostnames) and (e.key.get_name() == keytype):
-                e.key = key
-                return
+                if e.key.asbytes() == key.asbytes():
+                    # Same key stored twice; nothing to do.
+                    return
+                raise HostKeyConflictError(
+                    "Refusing to overwrite existing {!r} host key for {!r} "
+                    "with a different key; remove the old entry first "
+                    "(possible host key change/rotation)".format(
+                        keytype, hostname
+                    )
+                )
         self._entries.append(HostKeyEntry([hostname], key))
 
     def load(self, filename):
@@ -77,13 +114,18 @@ class HostKeys(MutableMapping):
         ``os.path.expanduser("~/.ssh/known_hosts")``.
 
         If this method is called multiple times, the host keys are merged,
-        not cleared.  So multiple calls to `load` will just call `add`,
-        replacing any existing entries and adding new ones.
+        not cleared.  Entries for hosts (or host/key-type pairs) not yet
+        present are added; identical entries are ignored.  A line carrying a
+        *different* key for a ``(hostname, keytype)`` pair that already has a
+        key stored is a conflict and is skipped (with a warning) instead of
+        silently replacing the known key -- remove the stale entry yourself
+        if the key really did change.
 
         :param str filename: name of the file to read host keys from
 
         :raises: ``IOError`` -- if there was an error reading the file
         """
+        log = get_logger("paramiko.hostkeys")
         with open(filename, "r") as f:
             for lineno, line in enumerate(f, 1):
                 line = line.strip()
@@ -91,15 +133,45 @@ class HostKeys(MutableMapping):
                     continue
                 try:
                     entry = HostKeyEntry.from_line(line, lineno)
-                except SSHException:
+                except (SSHException, InvalidHostKey):
+                    # Unparsable line: log (inside from_line) and skip it,
+                    # like OpenSSH does, instead of taking the whole file
+                    # down.
                     continue
-                if entry is not None:
-                    _hostnames = entry.hostnames
-                    for h in _hostnames:
-                        if self.check(h, entry.key):
-                            entry.hostnames.remove(h)
-                    if len(entry.hostnames):
-                        self._entries.append(entry)
+                if entry is None:
+                    continue
+                # Only keep hostnames that are not already known with the
+                # same key; note that we must not mutate entry.hostnames
+                # while iterating over it.
+                new_hostnames = []
+                for h in entry.hostnames:
+                    known = self.lookup(h)
+                    if known is None:
+                        new_hostnames.append(h)
+                        continue
+                    known_key = known.get(entry.key.get_name())
+                    if known_key is None:
+                        # Host is known, but not for this key type: keep the
+                        # new (host, keytype) pair.
+                        new_hostnames.append(h)
+                    elif known_key.asbytes() != entry.key.asbytes():
+                        # Conflict: a *different* key of the same type is
+                        # already stored for this host.  OpenSSH rejects
+                        # such lines rather than silently replacing the
+                        # stored key, so do the same.
+                        log.warning(
+                            "Ignoring conflicting %s host key for %r in "
+                            "line %d of %s (key differs from the one "
+                            "already stored)",
+                            entry.key.get_name(),
+                            h,
+                            lineno,
+                            filename,
+                        )
+                    # else: identical key already known -> skip hostname
+                if new_hostnames:
+                    entry.hostnames = new_hostnames
+                    self._entries.append(entry)
 
     def save(self, filename):
         """
@@ -154,7 +226,7 @@ class HostKeys(MutableMapping):
 
             def __getitem__(self, key):
                 for e in self._entries:
-                    if e.key.get_name() == key:
+                    if e.key is not None and e.key.get_name() == key:
                         return e.key
                 raise KeyError(key)
 
@@ -173,11 +245,13 @@ class HostKeys(MutableMapping):
                     self._hostkeys._entries.append(e)
 
             def keys(self):
-                return [
-                    e.key.get_name()
-                    for e in self._entries
-                    if e.key is not None
-                ]
+                ret = []
+                for e in self._entries:
+                    if e.key is not None:
+                        name = e.key.get_name()
+                        if name not in ret:
+                            ret.append(name)
+                return ret
 
         entries = []
         for e in self._entries:
@@ -191,17 +265,92 @@ class HostKeys(MutableMapping):
         """
         Tests whether ``hostname`` string matches given SubDict ``entry``.
 
+        Hostname patterns follow the OpenSSH ``known_hosts`` rules:
+
+        * plain names and ``[host]:port`` names match literally;
+        * ``|1|salt|hash`` entries are hashed hostnames (see
+          `hash_host`) and are checked by hashing the looked-up name with
+          the entry's salt; the bracketed ``[host]:port`` form of the
+          looked-up name is tried as well, since hashed entries may have
+          been stored for a non-default port;
+        * patterns may contain ``*`` and ``?`` glob characters, matched
+          shell-style against the whole host name (so ``*.example.com``
+          matches ``foo.example.com`` but not ``example.com``);
+        * a pattern prefixed with ``!`` negates the match.  Negated
+          patterns take precedence: if any negated pattern matches, the
+          whole entry does not match, regardless of positive patterns.
+
         :returns bool:
         """
-        for h in entry.hostnames:
-            if (
-                h == hostname
-                or h.startswith("|1|")
-                and not hostname.startswith("|1|")
-                and constant_time_bytes_eq(self.hash_host(hostname, h), h)
-            ):
+        matched = False
+        for pattern in entry.hostnames:
+            negated = pattern.startswith("!")
+            bare = pattern[1:] if negated else pattern
+            # A negation pattern names a host (or host pattern) without a
+            # port, so it is evaluated against the host portion of a
+            # bracketed [host]:port lookup as well.
+            if self._pattern_matches(hostname, bare, strip_port=negated):
+                if negated:
+                    # Negation always wins for the whole entry.
+                    return False
+                matched = True
+        return matched
+
+    def _pattern_matches(self, hostname, pattern, strip_port=False):
+        """
+        Check a single (non-negated) known-hosts ``pattern`` against
+        ``hostname``.
+
+        :param bool strip_port:
+            when true (used for negation patterns, which never carry a
+            port), the host portion of a bracketed ``[host]:port`` lookup
+            is tested in addition to the full name.
+
+        :returns bool:
+        """
+        if pattern.startswith("|1|"):
+            # Hashed hostname: compare HMAC hashes instead of strings.
+            if hostname.startswith("|1|"):
+                return False
+            for candidate in self._hostname_variants(hostname):
+                if constant_time_bytes_eq(
+                    self.hash_host(candidate, pattern), pattern
+                ):
+                    return True
+            return False
+        # OpenSSH pattern matching only knows '*' and '?'; a '[' in a
+        # bracketed [host]:port name is literal, not a glob character set.
+        is_glob = "*" in pattern or "?" in pattern
+        if not is_glob and not strip_port:
+            # Literal names (including explicit [host]:port entries) match
+            # exactly; the port is a distinct dimension from the host name.
+            return pattern == hostname
+        # Globs and negations name a host without a port, so test the host
+        # portion of a bracketed [host]:port lookup as well.
+        for candidate in self._hostname_variants(hostname):
+            if is_glob:
+                if fnmatch.fnmatchcase(candidate, pattern):
+                    return True
+            elif pattern == candidate:
                 return True
         return False
+
+    @staticmethod
+    def _hostname_variants(hostname):
+        """
+        Yield the names to try when matching a hashed known-hosts entry.
+
+        A hashed entry may have been stored for either the bare hostname
+        or the OpenSSH bracketed ``[host]:port`` form, so both are tried
+        when applicable.
+        """
+        yield hostname
+        if hostname.startswith("[") and "]:" in hostname:
+            # [host]:port -> also try the bare host
+            yield hostname[1:].split("]:", 1)[0]
+        else:
+            # bare host -> also try its bracketed form on the default port
+            yield "[{}]:22".format(hostname)
 
     def check(self, hostname, key):
         """
@@ -302,7 +451,7 @@ class HostKeys(MutableMapping):
         return hostkey.replace("\n", "")
 
 
-class InvalidHostKey(Exception):
+class InvalidHostKey(SSHException):
     def __init__(self, line, exc):
         self.line = line
         self.exc = exc
@@ -324,8 +473,9 @@ class HostKeyEntry:
         """
         Parses the given line of text to find the names for the host,
         the type of key, and the key data. The line is expected to be in the
-        format used by the OpenSSH known_hosts file. Fields are separated by a
-        single space or tab.
+        format used by the OpenSSH known_hosts file. Fields are separated by
+        one or more spaces or tabs; any content after the key data (such as
+        a comment) is ignored.
 
         Lines are expected to not have leading or trailing whitespace.
         We don't bother to check for comments or empty lines.  All of
@@ -334,16 +484,25 @@ class HostKeyEntry:
         :param str line: a line from an OpenSSH known_hosts file
         """
         log = get_logger("paramiko.hostkeys")
-        fields = re.split(" |\t", line)
+        # OpenSSH splits on runs of whitespace and treats the first three
+        # fields as hostnames, key type and key; anything afterwards is a
+        # comment.
+        fields = re.split(r"[ \t]+", line, maxsplit=2)
         if len(fields) < 3:
             # Bad number of fields
             msg = "Not enough fields found in known_hosts in line {} ({!r})"
             log.info(msg.format(lineno, line))
             return None
-        fields = fields[:3]
 
         names, key_type, key = fields
+        # Strip any trailing comment (OpenSSH allows free text after the
+        # base64 key).
+        key = key.split()[0]
         names = names.split(",")
+        if not all(names) or not key_type or not key:
+            msg = "Empty field found in known_hosts in line {} ({!r})"
+            log.info(msg.format(lineno, line))
+            return None
 
         # Decide what kind of key we're looking at and create an object
         # to hold it accordingly.
